@@ -201,7 +201,7 @@ Comprehensive engineering documentation is available in `docintel/docs/`:
 
 ## License
 
-[To be determined]
+Apache License
 
 ## Contributing
 
