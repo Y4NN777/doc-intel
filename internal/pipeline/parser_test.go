@@ -71,7 +71,7 @@ func TestPDFParser_DetectLanguage_Unknown(t *testing.T) {
 // Integration test - requires a real PDF file
 func TestPDFParser_Extract_RealPDF(t *testing.T) {
 	// Skip if no test PDF available
-	testPDF := filepath.Join("testdata", "sample.pdf")
+	testPDF := filepath.Join("testdata", "resume_en.pdf")
 	if _, err := os.Stat(testPDF); os.IsNotExist(err) {
 		t.Skip("Skipping integration test: no test PDF available")
 	}
@@ -87,13 +87,34 @@ func TestPDFParser_Extract_RealPDF(t *testing.T) {
 		t.Error("expected at least one page")
 	}
 	
-	if lang == domain.LanguageUnknown {
-		t.Log("Warning: language detection returned unknown")
+	// Log extracted text for debugging
+	for i, page := range pages {
+		t.Logf("Page %d text length: %d chars", i+1, len(page.Text))
+		if len(page.Text) > 100 {
+			t.Logf("Page %d text preview: %q...", i+1, page.Text[:100])
+		} else {
+			t.Logf("Page %d text: %q", i+1, page.Text)
+		}
 	}
 	
-	for _, page := range pages {
-		if page.PageNumber < 1 {
-			t.Errorf("invalid page number: %d", page.PageNumber)
-		}
+	if pages[0].PageNumber != 1 {
+		t.Errorf("expected page number 1, got %d", pages[0].PageNumber)
+	}
+	
+	// Check that we extracted some text
+	if len(pages[0].Text) == 0 {
+		t.Error("expected non-empty text from page 1")
+	}
+	
+	// Language detection may fail if PDF text extraction doesn't preserve spaces
+	// This is a known limitation of some PDF parsers
+	t.Logf("Detected language: %s", lang)
+	if lang == domain.LanguageUnknown {
+		t.Log("Note: Language detection failed - likely due to missing word boundaries in extracted text")
+	}
+	
+	// Check source is text layer
+	if pages[0].Source != domain.ChunkSourceTextLayer {
+		t.Errorf("expected text_layer source, got %s", pages[0].Source)
 	}
 }
