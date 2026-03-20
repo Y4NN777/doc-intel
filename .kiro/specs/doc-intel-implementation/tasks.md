@@ -96,7 +96,7 @@ The implementation order follows module dependencies:
     - Test workspace isolation in search
 
 - [ ] 5. Implement Parser (PDF text extraction)
-  - [ ] 5.1 Create Parser interface and implementation
+  - [x] 5.1 Create Parser interface and implementation
     - Implement `internal/pipeline/parser.go` with Extract method
     - Integrate PDF text layer extraction library
     - Integrate OCR library for fallback

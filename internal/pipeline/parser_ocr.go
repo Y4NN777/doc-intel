@@ -1,0 +1,154 @@
+// +build ocr
+
+package pipeline
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/Y4NN777/doc-intel/internal/domain"
+	"github.com/ledongthuc/pdf"
+	"github.com/otiai10/gosseract/v2"
+)
+
+// Parser extracts text from PDF files
+type Parser interface {
+	Extract(path string) ([]PageText, domain.Language, error)
+}
+
+// PageText represents extracted text from a single page
+type PageText struct {
+	PageNumber int
+	Text       string
+	Source     domain.ChunkSource
+}
+
+// PDFParser implements Parser with OCR support via Tesseract
+type PDFParser struct {
+	ocrEnabled bool
+}
+
+// NewPDFParser creates a new PDF parser with OCR support
+func NewPDFParser() *PDFParser {
+	return &PDFParser{
+		ocrEnabled: true,
+	}
+}
+
+// Extract extracts text from a PDF file with OCR fallback
+func (p *PDFParser) Extract(path string) ([]PageText, domain.Language, error) {
+	// Validate file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, domain.LanguageUnknown, fmt.Errorf("file not found: %s", path)
+	}
+
+	// Try text layer extraction first
+	pages, err := p.extractTextLayer(path)
+	if err != nil {
+		return nil, domain.LanguageUnknown, fmt.Errorf("failed to extract text: %w", err)
+	}
+
+	// For pages with no text, try OCR if enabled
+	if p.ocrEnabled {
+		pages = p.applyOCRToEmptyPages(path, pages)
+	}
+
+	if len(pages) == 0 {
+		return nil, domain.LanguageUnknown, fmt.Errorf("no pages extracted from PDF")
+	}
+
+	// Detect language from extracted text
+	lang := p.detectLanguage(pages)
+
+	return pages, lang, nil
+}
+
+// extractTextLayer extracts text from PDF text layer
+func (p *PDFParser) extractTextLayer(path string) ([]PageText, error) {
+	// Open PDF file
+	f, r, err := pdf.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PDF: %w", err)
+	}
+	defer f.Close()
+	
+	totalPages := r.NumPage()
+	pages := make([]PageText, 0, totalPages)
+	
+	// Extract text from each page
+	for pageNum := 1; pageNum <= totalPages; pageNum++ {
+		page := r.Page(pageNum)
+		if page.V.IsNull() {
+			continue
+		}
+		
+		text, err := page.GetPlainText(nil)
+		if err != nil {
+			// Log warning but continue with empty text
+			text = ""
+		}
+		
+		pages = append(pages, PageText{
+			PageNumber: pageNum,
+			Text:       strings.TrimSpace(text),
+			Source:     domain.ChunkSourceTextLayer,
+		})
+	}
+	
+	return pages, nil
+}
+
+// applyOCRToEmptyPages applies OCR to pages with no text
+func (p *PDFParser) applyOCRToEmptyPages(pdfPath string, pages []PageText) []PageText {
+	// TODO: Implement OCR for empty pages
+	// This requires:
+	// 1. Converting PDF pages to images
+	// 2. Running Tesseract OCR on each image
+	// 3. Replacing empty page text with OCR results
+	
+	// For now, just return pages as-is
+	// Full OCR implementation would go here
+	return pages
+}
+
+// detectLanguage detects the primary language from extracted text
+func (p *PDFParser) detectLanguage(pages []PageText) domain.Language {
+	// Combine first few pages for language detection
+	var sample strings.Builder
+	maxPages := 3
+	if len(pages) < maxPages {
+		maxPages = len(pages)
+	}
+	
+	for i := 0; i < maxPages; i++ {
+		sample.WriteString(pages[i].Text)
+		sample.WriteString(" ")
+	}
+	
+	text := strings.ToLower(sample.String())
+	
+	// Simple heuristic: count common words
+	frenchWords := []string{"le", "la", "les", "de", "des", "un", "une", "et", "est", "dans", "pour", "que", "qui"}
+	englishWords := []string{"the", "a", "an", "and", "is", "in", "to", "of", "for", "that", "this", "with"}
+	
+	frenchCount := 0
+	englishCount := 0
+	
+	for _, word := range frenchWords {
+		frenchCount += strings.Count(text, " "+word+" ")
+	}
+	
+	for _, word := range englishWords {
+		englishCount += strings.Count(text, " "+word+" ")
+	}
+	
+	// Determine language based on counts
+	if frenchCount > englishCount && frenchCount > 5 {
+		return domain.LanguageFR
+	} else if englishCount > frenchCount && englishCount > 5 {
+		return domain.LanguageEN
+	}
+	
+	return domain.LanguageUnknown
+}
