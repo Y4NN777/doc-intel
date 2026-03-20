@@ -1,20 +1,19 @@
-// +build !faiss
+// +build faiss
 
 package vectorindex
 
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 
+	"github.com/DataIntelligenceCrew/go-faiss"
 	"github.com/Y4NN777/doc-intel/internal/domain"
 )
 
-// Index provides ANN search over chunk embeddings
+// Index provides ANN search over chunk embeddings using FAISS
 // Enforces INV-02, INV-09: workspace-scoped search
 type Index interface {
 	// Insert adds vectors to the index for a workspace
@@ -30,21 +29,12 @@ type Index interface {
 	DeleteWorkspace(workspaceID string) error
 }
 
-// FAISSIndex implements Index using pure Go (fallback when FAISS not available)
-// This is a development/testing implementation
-// For production with FAISS, build with: go build -tags faiss
+// FAISSIndex implements Index using FAISS library via CGO
 type FAISSIndex struct {
 	baseDir string
 	mu      sync.RWMutex
-	// In-memory cache of vectors per workspace for fast search
-	vectors map[string][]vectorEntry // workspaceID -> vectors
-}
-
-// vectorEntry stores a vector with its metadata
-type vectorEntry struct {
-	ChunkID    string
-	DocumentID string
-	Values     []float32
+	// In-memory FAISS indexes per workspace
+	indexes map[string]faiss.Index // workspaceID -> FAISS index
 }
 
 // WorkspaceMetadata tracks chunk_id to vector_index mappings
@@ -54,15 +44,14 @@ type WorkspaceMetadata struct {
 	Chunks      []ChunkVector `json:"chunks"`
 }
 
-// ChunkVector maps a chunk ID to its position in the index
+// ChunkVector maps a chunk ID to its position in the FAISS index
 type ChunkVector struct {
 	ChunkID     string `json:"chunk_id"`
 	DocumentID  string `json:"document_id"`
 	VectorIndex int    `json:"vector_index"`
 }
 
-// NewFAISSIndex creates a new vector index
-// baseDir: root directory for workspace storage (defaults to ~/.docintel/workspaces)
+// NewFAISSIndex creates a new vector index with FAISS CGO bindings
 func NewFAISSIndex(baseDir string) (*FAISSIndex, error) {
 	if baseDir == "" {
 		homeDir, err := os.UserHomeDir()
@@ -78,7 +67,7 @@ func NewFAISSIndex(baseDir string) (*FAISSIndex, error) {
 
 	return &FAISSIndex{
 		baseDir: baseDir,
-		vectors: make(map[string][]vectorEntry),
+		indexes: make(map[string]faiss.Index),
 	}, nil
 }
 
@@ -92,7 +81,7 @@ func (f *FAISSIndex) metadataPath(workspaceID string) string {
 	return filepath.Join(f.workspaceDir(workspaceID), "metadata.json")
 }
 
-// indexPath returns the path to the index file for a workspace
+// indexPath returns the path to the FAISS index file for a workspace
 func (f *FAISSIndex) indexPath(workspaceID string) string {
 	return filepath.Join(f.workspaceDir(workspaceID), "index.faiss")
 }
@@ -170,12 +159,24 @@ func (f *FAISSIndex) Insert(workspaceID string, vectors []domain.Vector) error {
 		}
 	}
 
-	// Load existing vectors
-	if err := f.loadVectors(workspaceID); err != nil {
-		return fmt.Errorf("failed to load existing vectors: %w", err)
+	// Load or create FAISS index
+	idx, err := f.loadIndex(workspaceID, meta.Dimensions)
+	if err != nil {
+		return fmt.Errorf("failed to load index: %w", err)
 	}
 
-	// Add new vectors to in-memory cache
+	// Prepare vectors for FAISS (flatten to single slice)
+	flatVectors := make([]float32, 0, len(vectors)*meta.Dimensions)
+	for _, v := range vectors {
+		flatVectors = append(flatVectors, v.Values...)
+	}
+
+	// Add vectors to FAISS index
+	if err := idx.Add(flatVectors); err != nil {
+		return fmt.Errorf("failed to add vectors to FAISS index: %w", err)
+	}
+
+	// Update metadata with new chunks
 	startIndex := len(meta.Chunks)
 	for i, v := range vectors {
 		meta.Chunks = append(meta.Chunks, ChunkVector{
@@ -183,17 +184,11 @@ func (f *FAISSIndex) Insert(workspaceID string, vectors []domain.Vector) error {
 			DocumentID:  "",
 			VectorIndex: startIndex + i,
 		})
-		
-		f.vectors[workspaceID] = append(f.vectors[workspaceID], vectorEntry{
-			ChunkID:    v.ChunkID,
-			DocumentID: "",
-			Values:     v.Values,
-		})
 	}
 
-	// Persist vectors and metadata
-	if err := f.saveVectors(workspaceID); err != nil {
-		return fmt.Errorf("failed to save vectors: %w", err)
+	// Persist index and metadata
+	if err := f.saveIndex(workspaceID, idx); err != nil {
+		return fmt.Errorf("failed to save index: %w", err)
 	}
 
 	if err := f.saveMetadata(meta); err != nil {
@@ -203,7 +198,7 @@ func (f *FAISSIndex) Insert(workspaceID string, vectors []domain.Vector) error {
 	return nil
 }
 
-// Search performs ANN search scoped to a workspace using cosine similarity
+// Search performs ANN search scoped to a workspace using FAISS
 func (f *FAISSIndex) Search(workspaceID string, query []float32, k int) ([]string, []float64, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -223,55 +218,40 @@ func (f *FAISSIndex) Search(workspaceID string, query []float32, k int) ([]strin
 		return nil, nil, fmt.Errorf("query dimension %d does not match index dimension %d", len(query), meta.Dimensions)
 	}
 
-	// Load vectors if not in cache
-	if _, exists := f.vectors[workspaceID]; !exists {
+	// Load FAISS index
+	idx, exists := f.indexes[workspaceID]
+	if !exists {
 		f.mu.RUnlock()
 		f.mu.Lock()
-		if err := f.loadVectors(workspaceID); err != nil {
-			f.mu.Unlock()
-			f.mu.RLock()
-			return nil, nil, fmt.Errorf("failed to load vectors: %w", err)
-		}
+		var loadErr error
+		idx, loadErr = f.loadIndex(workspaceID, meta.Dimensions)
 		f.mu.Unlock()
 		f.mu.RLock()
+		
+		if loadErr != nil {
+			return nil, nil, fmt.Errorf("failed to load index: %w", loadErr)
+		}
 	}
 
-	vectors := f.vectors[workspaceID]
-	if len(vectors) == 0 {
-		return []string{}, []float64{}, nil
+	// Perform FAISS search
+	distances, labels, err := idx.Search(query, int64(k))
+	if err != nil {
+		return nil, nil, fmt.Errorf("FAISS search failed: %w", err)
 	}
 
-	// Compute cosine similarity for all vectors
-	type result struct {
-		chunkID string
-		score   float64
-	}
+	// Map FAISS labels (vector indices) to chunk IDs
+	chunkIDs := make([]string, 0, k)
+	scores := make([]float64, 0, k)
 	
-	results := make([]result, 0, len(vectors))
-	for _, vec := range vectors {
-		similarity := cosineSimilarity(query, vec.Values)
-		results = append(results, result{
-			chunkID: vec.ChunkID,
-			score:   similarity,
-		})
-	}
-
-	// Sort by score descending
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].score > results[j].score
-	})
-
-	// Return top k results
-	limit := k
-	if limit > len(results) {
-		limit = len(results)
-	}
-
-	chunkIDs := make([]string, limit)
-	scores := make([]float64, limit)
-	for i := 0; i < limit; i++ {
-		chunkIDs[i] = results[i].chunkID
-		scores[i] = results[i].score
+	for i := 0; i < len(labels) && i < k; i++ {
+		vectorIdx := int(labels[i])
+		if vectorIdx < 0 || vectorIdx >= len(meta.Chunks) {
+			continue
+		}
+		
+		chunkIDs = append(chunkIDs, meta.Chunks[vectorIdx].ChunkID)
+		// Convert L2 distance to similarity score (inverse)
+		scores = append(scores, 1.0/(1.0+float64(distances[i])))
 	}
 
 	return chunkIDs, scores, nil
@@ -302,38 +282,47 @@ func (f *FAISSIndex) Delete(documentID string) error {
 			continue
 		}
 
-		// Filter out chunks belonging to this document
-		filteredChunks := make([]ChunkVector, 0)
+		// Find chunks belonging to this document
+		toRemove := make([]int64, 0)
+		newChunks := make([]ChunkVector, 0)
+		
 		for _, chunk := range meta.Chunks {
-			if chunk.DocumentID != documentID {
-				filteredChunks = append(filteredChunks, chunk)
+			if chunk.DocumentID == documentID {
+				toRemove = append(toRemove, int64(chunk.VectorIndex))
+			} else {
+				newChunks = append(newChunks, chunk)
 			}
 		}
 
-		if len(filteredChunks) == len(meta.Chunks) {
+		if len(toRemove) == 0 {
 			continue
 		}
 
-		meta.Chunks = filteredChunks
+		// Load FAISS index
+		idx, err := f.loadIndex(workspaceID, meta.Dimensions)
+		if err != nil {
+			return fmt.Errorf("failed to load index for workspace %s: %w", workspaceID, err)
+		}
+
+		// Remove vectors from FAISS index
+		selector, err := faiss.NewIDSelectorBatch(toRemove)
+		if err != nil {
+			return fmt.Errorf("failed to create ID selector: %w", err)
+		}
+		defer selector.Delete()
+
+		if _, err := idx.RemoveIDs(selector); err != nil {
+			return fmt.Errorf("failed to remove IDs from FAISS index: %w", err)
+		}
+
+		// Update metadata
+		meta.Chunks = newChunks
 		for i := range meta.Chunks {
 			meta.Chunks[i].VectorIndex = i
 		}
 
-		// Load and filter vectors
-		if err := f.loadVectors(workspaceID); err != nil {
-			return fmt.Errorf("failed to load vectors for workspace %s: %w", workspaceID, err)
-		}
-
-		filteredVectors := make([]vectorEntry, 0)
-		for _, vec := range f.vectors[workspaceID] {
-			if vec.DocumentID != documentID {
-				filteredVectors = append(filteredVectors, vec)
-			}
-		}
-		f.vectors[workspaceID] = filteredVectors
-
-		if err := f.saveVectors(workspaceID); err != nil {
-			return fmt.Errorf("failed to save vectors for workspace %s: %w", workspaceID, err)
+		if err := f.saveIndex(workspaceID, idx); err != nil {
+			return fmt.Errorf("failed to save index for workspace %s: %w", workspaceID, err)
 		}
 
 		if err := f.saveMetadata(meta); err != nil {
@@ -349,7 +338,10 @@ func (f *FAISSIndex) DeleteWorkspace(workspaceID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	delete(f.vectors, workspaceID)
+	if idx, exists := f.indexes[workspaceID]; exists {
+		idx.Delete()
+		delete(f.indexes, workspaceID)
+	}
 	
 	wsDir := f.workspaceDir(workspaceID)
 	if err := os.RemoveAll(wsDir); err != nil {
@@ -362,76 +354,45 @@ func (f *FAISSIndex) DeleteWorkspace(workspaceID string) error {
 	return nil
 }
 
-// loadVectors loads vectors from disk into memory cache
-func (f *FAISSIndex) loadVectors(workspaceID string) error {
-	if _, exists := f.vectors[workspaceID]; exists {
-		return nil
+// loadIndex loads or creates a FAISS index for a workspace
+func (f *FAISSIndex) loadIndex(workspaceID string, dimensions int) (faiss.Index, error) {
+	if idx, exists := f.indexes[workspaceID]; exists {
+		return idx, nil
 	}
 
 	indexPath := f.indexPath(workspaceID)
 	
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		f.vectors[workspaceID] = []vectorEntry{}
-		return nil
-	}
-
-	data, err := os.ReadFile(indexPath)
-	if err != nil {
-		return fmt.Errorf("failed to read index file: %w", err)
-	}
-
-	var vectors []vectorEntry
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &vectors); err != nil {
-			return fmt.Errorf("failed to unmarshal vectors: %w", err)
+	// Try to load existing index from disk
+	if _, err := os.Stat(indexPath); err == nil {
+		idx, err := faiss.ReadIndex(indexPath, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read FAISS index: %w", err)
 		}
+		f.indexes[workspaceID] = idx
+		return idx, nil
 	}
 
-	f.vectors[workspaceID] = vectors
-	return nil
+	// Create new FAISS index (IndexFlatL2 for L2 distance)
+	idx, err := faiss.NewIndexFlatL2(dimensions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create FAISS index: %w", err)
+	}
+
+	f.indexes[workspaceID] = idx
+	return idx, nil
 }
 
-// saveVectors persists vectors from memory cache to disk
-func (f *FAISSIndex) saveVectors(workspaceID string) error {
-	vectors, exists := f.vectors[workspaceID]
-	if !exists {
-		vectors = []vectorEntry{}
-	}
-
-	data, err := json.Marshal(vectors)
-	if err != nil {
-		return fmt.Errorf("failed to marshal vectors: %w", err)
-	}
-
+// saveIndex persists a FAISS index to disk
+func (f *FAISSIndex) saveIndex(workspaceID string, idx faiss.Index) error {
 	wsDir := f.workspaceDir(workspaceID)
 	if err := os.MkdirAll(wsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create workspace directory: %w", err)
 	}
 
 	indexPath := f.indexPath(workspaceID)
-	if err := os.WriteFile(indexPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write index file: %w", err)
+	if err := faiss.WriteIndex(idx, indexPath); err != nil {
+		return fmt.Errorf("failed to write FAISS index: %w", err)
 	}
 
 	return nil
-}
-
-// cosineSimilarity computes the cosine similarity between two vectors
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) != len(b) {
-		return 0
-	}
-
-	var dotProduct, normA, normB float64
-	for i := range a {
-		dotProduct += float64(a[i]) * float64(b[i])
-		normA += float64(a[i]) * float64(a[i])
-		normB += float64(b[i]) * float64(b[i])
-	}
-
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-
-	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
